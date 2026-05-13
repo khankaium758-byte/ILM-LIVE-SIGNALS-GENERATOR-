@@ -1,0 +1,306 @@
+import WebSocket from 'ws';
+import { EventEmitter } from 'events';
+
+export enum OrderDirection {
+  CALL = 'call',
+  PUT = 'put'
+}
+
+export enum OrderStatus {
+  OPEN = 'open',
+  CLOSED = 'closed',
+  WIN = 'win',
+  LOSS = 'loss',
+  DRAW = 'draw'
+}
+
+export interface QuotexOrder {
+  id: string;
+  asset: string;
+  amount: number;
+  direction: OrderDirection;
+  duration: number;
+  status: OrderStatus;
+  profit?: number;
+}
+
+export class QuotexClient extends EventEmitter {
+  private ws: WebSocket | null = null;
+  private ssid: string;
+  private isDemo: boolean;
+  private pingInterval: NodeJS.Timeout | null = null;
+  private authenticated = false;
+  private assets: any[] = [];
+  private balance: number = 0;
+  private orders = new Map<string, any>();
+  private profile: any = null;
+
+  constructor(ssid: string, isDemo: boolean = true) {
+    super();
+    this.ssid = ssid;
+    this.isDemo = isDemo;
+  }
+
+  setAccountType(isDemo: boolean) {
+    if (this.isDemo !== isDemo) {
+      this.isDemo = isDemo;
+      this.authenticated = false; // Force re-auth
+      if (this.ws) {
+        this.ws.terminate();
+        this.ws = null;
+      }
+    }
+  }
+
+  private connecting: Promise<boolean> | null = null;
+
+  private lastErrorTime: number = 0;
+  private cooldownMs: number = 5000;
+
+  async connect(): Promise<boolean> {
+    if (Date.now() - this.lastErrorTime < this.cooldownMs) {
+      console.log('Quotex connection is in cooldown');
+      return false;
+    }
+
+    if (this.authenticated && this.ws?.readyState === WebSocket.OPEN) {
+      console.log('Quotex already authenticated and connected');
+      return true;
+    }
+
+    if (this.connecting) {
+      return this.connecting;
+    }
+
+    this.connecting = new Promise((resolve) => {
+      // Close existing if any
+      if (this.ws) {
+        this.ws.removeAllListeners();
+        this.ws.terminate();
+        this.ws = null;
+      }
+
+      const url = 'wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket';
+      console.log(`Connecting to Quotex (Demo: ${this.isDemo})...`);
+      
+      this.ws = new WebSocket(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+          'Origin': 'https://qxbroker.com'
+        },
+        handshakeTimeout: 10000
+      });
+
+      const timeout = setTimeout(() => {
+        console.log('Quotex connection timeout');
+        this.connecting = null;
+        resolve(false);
+      }, 15000);
+
+      this.ws.on('open', () => {
+        console.log('Quotex WS Connected');
+        this.send('40');
+      });
+
+      this.ws.on('error', (err: any) => {
+        console.error('Quotex Client WS Error:', err.message || err);
+        this.lastErrorTime = Date.now();
+        clearTimeout(timeout);
+        this.connecting = null;
+        resolve(false);
+      });
+
+      this.ws.on('message', (data: string) => {
+        this.handleMessage(data.toString());
+      });
+
+      this.ws.on('close', () => {
+        console.log('Quotex WS Closed');
+        this.stopPing();
+        this.authenticated = false;
+        this.connecting = null;
+        this.emit('disconnected');
+      });
+
+      this.once('authenticated', () => {
+        clearTimeout(timeout);
+        this.authenticated = true;
+        this.connecting = null;
+        this.startPing();
+        this.send('451-["instruments/list",{"_placeholder":true,"num":0}]');
+        resolve(true);
+      });
+    });
+
+    return this.connecting;
+  }
+
+  private startPing() {
+    this.pingInterval = setInterval(() => {
+      this.send('2'); // Engine.IO Ping
+    }, 25000);
+  }
+
+  private stopPing() {
+    if (this.pingInterval) clearInterval(this.pingInterval);
+  }
+
+  private send(msg: string) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(msg);
+    }
+  }
+
+  private smcData = {
+    orderBlocks: [] as any[],
+    fairValueGaps: [] as any[],
+    liquidity: [] as any[]
+  };
+
+  private handleMessage(msg: string) {
+    // Heartbeat Pong
+    if (msg === '3') return;
+
+    // Initial session info
+    if (msg.startsWith('0{')) {
+      const auth = JSON.stringify({
+        session: this.ssid,
+        isDemo: this.isDemo ? 1 : 0,
+        tournamentId: 0
+      });
+      this.send(`42["authorization",${auth}]`);
+      return;
+    }
+
+    // Socket.IO Events
+    if (msg.startsWith('42[')) {
+      try {
+        const [event, data] = JSON.parse(msg.substring(2));
+        this.processEvent(event, data);
+      } catch (e) {
+        console.error('Parse error', e);
+      }
+    }
+
+    // Binary placeholder headers (451-) followed by actual data (4)
+    if (msg.startsWith('4')) {
+      try {
+        // Simple heuristic for binary JSON frames following a header
+        if (msg.includes('"balance"')) {
+           const data = JSON.parse(msg.substring(msg.indexOf('{')));
+           this.balance = data.balance;
+           this.emit('balance', this.balance);
+        }
+      } catch (e) {}
+    }
+  }
+
+  private processEvent(event: string, data: any) {
+    switch (event) {
+      case 's_authorization':
+        this.profile = data.user || data;
+        this.emit('authenticated', data);
+        break;
+      case 'quotes/stream':
+        if (Array.isArray(data)) {
+          data.forEach(quote => {
+            if (Array.isArray(quote) && quote.length >= 3) {
+              this.emit('price', { asset: quote[0], price: quote[2] });
+            }
+          });
+        }
+        break;
+      case 'instruments/list':
+        this.assets = data;
+        this.emit('assets', data);
+        break;
+      case 'successupdateBalance':
+        this.balance = data.balance;
+        this.emit('balance', this.balance);
+        break;
+      case 's_orders/open':
+      case 'successopenOrder':
+        this.orders.set(data.id || data.requestId, data);
+        this.emit('order_opened', data);
+        break;
+      case 's_orders/close':
+      case 'successcloseOrder':
+        const order = data.ticket || data;
+        this.orders.set(order.id, order);
+        this.emit('order_closed', order);
+        break;
+      case 'candle-generate':
+        this.handleCandles(data);
+        break;
+    }
+  }
+
+  private handleCandles(data: any) {
+    const { asset, candles } = data;
+    this.analyzeSMC(asset, candles);
+  }
+
+  private analyzeSMC(asset: string, candles: any[]) {
+    if (!candles || candles.length < 20) return;
+
+    const recentCandles = candles.slice(-20);
+    const orderBlocks = [];
+
+    // Order Block Detection
+    for (let i = 1; i < recentCandles.length - 2; i++) {
+        const candle = recentCandles[i];
+        const prev = recentCandles[i-1];
+        const next = recentCandles[i+1];
+
+        // Bullish Order Block
+        if (candle.close > candle.open && 
+            prev.close < prev.open && 
+            next.close > candle.high) {
+            orderBlocks.push({
+                type: 'bullish',
+                high: candle.high,
+                low: candle.low,
+                strength: (candle.close - candle.open) / candle.open * 100
+            });
+        }
+    }
+
+    this.smcData.orderBlocks = orderBlocks.slice(-5);
+    this.emit('smc_analysis', { asset, orderBlocks });
+  }
+
+  async placeOrder(asset: string, amount: number, direction: OrderDirection, duration: number): Promise<string> {
+    if (!this.authenticated) throw new Error('Not authenticated');
+
+    const requestId = Date.now();
+    const payload = JSON.stringify({
+      asset,
+      amount,
+      time: duration,
+      action: direction,
+      isDemo: this.isDemo ? 1 : 0,
+      requestId,
+      optionType: 100 // Standard OTC
+    });
+
+    this.send(`42["orders/open",${payload}]`);
+    return requestId.toString();
+  }
+
+  async getBalance(): Promise<number> {
+    return this.balance;
+  }
+
+  getProfile(): any {
+    return this.profile;
+  }
+
+  async subscribeToAsset(asset: string) {
+    if (!this.authenticated) return;
+    this.send(`42["instruments/follow","${asset}"]`);
+  }
+
+  async disconnect() {
+    this.ws?.close();
+  }
+}
